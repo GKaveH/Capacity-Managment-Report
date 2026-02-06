@@ -1,0 +1,650 @@
+import json
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+# =========================
+# File paths
+# =========================
+INPUT_JSON = "vm_inventory.json"
+OUTPUT_XLSX = "vm_inventory.xlsx"
+
+# =========================
+# Styles
+# =========================
+BOLD = Font(bold=True)
+
+FILL_RUNNING = PatternFill("solid", fgColor="FFF59D")      # highlight running VMs
+FILL_SECTION = PatternFill("solid", fgColor="D9EAD3")      # summary rows
+FILL_STORAGE_HDR = PatternFill("solid", fgColor="CFE2F3")  # storage summary header
+
+# For Proxmox hosts, only include these disk devices when populating VM disk values
+PROXMOX_SCSI_ONLY = ["scsi0", "scsi1", "scsi2"]
+PROXMOX_SCSI_ONLY_SET = set(PROXMOX_SCSI_ONLY)
+
+
+def norm_status(s) -> str:
+    return str(s or "").strip().lower()
+
+
+def is_running(status: str) -> bool:
+    return norm_status(status) == "running"
+
+
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def zbx_percent_to_fraction(v):
+    """
+    Zabbix utilization is usually returned as a percent number (e.g. 36.51 means 36.51%).
+    Convert it into an Excel-friendly fraction (0.3651).
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return ""
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        try:
+            f = float(s)
+        except Exception:
+            return ""
+    else:
+        try:
+            f = float(v)
+        except Exception:
+            return ""
+    return f / 100.0
+
+
+def load_payload(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise ValueError("Expected JSON to be an object or a list at the top level.")
+    return data
+
+
+def detect_schema_any(data_list):
+    """
+    Supported schemas:
+      1) host_blocks: [{"host":..., "vms":[...], ...}]
+      2) flat_mixed: mixed list of VM objects and host-meta objects (no "vms" key)
+    """
+    if not data_list:
+        return "unknown"
+    any_host_blocks = any(isinstance(x, dict) and ("host" in x and "vms" in x) for x in data_list)
+    any_vm_objs = any(isinstance(x, dict) and ("vm_name" in x) for x in data_list)
+    if any_host_blocks:
+        return "host_blocks"
+    if any_vm_objs:
+        return "flat_mixed"
+    return "unknown"
+
+
+def group_flat_into_host_blocks(flat_list):
+    """
+    Converts a flat/mixed list into host blocks.
+
+    Host meta example:
+      {"host":..., "total_cpus":..., "total_memory_gb":..., "storages":[...], "storages_fs":[...], "location":...}
+
+    VM example:
+      {"vm_name":..., "host":..., "disks":[...], ...}
+    """
+    host_meta = {}
+    vm_buckets = {}
+
+    for obj in flat_list:
+        if not isinstance(obj, dict):
+            continue
+
+        if "vm_name" in obj:
+            h = obj.get("host") or obj.get("hypervisor") or obj.get("hv") or "N/A"
+            vm_buckets.setdefault(str(h), []).append(obj)
+            continue
+
+        if "host" in obj and ("vms" not in obj):
+            h = str(obj.get("host"))
+            host_meta[h] = {
+                "total_cpus": obj.get("total_cpus", ""),
+                "total_memory_gb": obj.get("total_memory_gb", ""),
+                "location": obj.get("location", "") or "unknown",
+                "storages": obj.get("storages", []) or [],
+                "storages_fs": obj.get("storages_fs", []) or [],
+                "ceph_pools": obj.get("ceph_pools", []) or [],
+                "ceph_vm_provisioned_by_pool_gb": obj.get("ceph_vm_provisioned_by_pool_gb", {}) or {},
+            }
+
+    all_hosts = sorted(set(vm_buckets.keys()) | set(host_meta.keys()))
+    host_blocks = []
+    for h in all_hosts:
+        meta = host_meta.get(h, {
+            "total_cpus": "", "total_memory_gb": "", "location": "unknown",
+            "storages": [], "storages_fs": [], "ceph_pools": [], "ceph_vm_provisioned_by_pool_gb": {}
+        })
+        host_blocks.append({
+            "host": h,
+            "location": meta.get("location", "unknown") or "unknown",
+            "total_cpus": meta.get("total_cpus", ""),
+            "total_memory_gb": meta.get("total_memory_gb", ""),
+            "storages": meta.get("storages", []) or [],
+            "storages_fs": meta.get("storages_fs", []) or [],
+            "ceph_pools": meta.get("ceph_pools", []) or [],
+            "ceph_vm_provisioned_by_pool_gb": meta.get("ceph_vm_provisioned_by_pool_gb", {}) or {},
+            "vms": vm_buckets.get(h, []),
+        })
+    return host_blocks
+
+
+def sanitize_sheet_name(name: str) -> str:
+    bad = [":", "\\", "/", "?", "*", "[", "]"]
+    s = str(name or "unknown")
+    for ch in bad:
+        s = s.replace(ch, "_")
+    s = s.strip() or "unknown"
+    return s[:31]
+
+
+def split_by_location(host_blocks):
+    buckets = {}
+    for hb in host_blocks:
+        loc = (hb.get("location") or "unknown").strip() or "unknown"
+        buckets.setdefault(loc, []).append(hb)
+    for loc in buckets:
+        buckets[loc] = sorted(buckets[loc], key=lambda x: str(x.get("host", "")))
+    return dict(sorted(buckets.items(), key=lambda kv: kv[0]))
+
+
+def discover_all_devices(host_blocks):
+    """
+    Discover all disk device names from the dataset (ide*, scsi*, virtio*, sata*, etc).
+    This ensures non-Proxmox locations keep their device columns.
+    """
+    all_devices = set()
+    for h in host_blocks:
+        for vm in (h.get("vms", []) or []):
+            for d in (vm.get("disks", []) or []):
+                dev = d.get("device")
+                if dev:
+                    all_devices.add(str(dev))
+    return sorted(all_devices)
+
+
+def is_proxmox_host(host_obj: dict) -> bool:
+    """
+    Treat host as Proxmox if it has a non-empty 'storages' list (pvesm status style).
+    """
+    st = host_obj.get("storages", [])
+    return isinstance(st, list) and len(st) > 0
+
+
+def human_size_from_gb(gb: float) -> str:
+    """
+    Human readable from GB using base-1024:
+      < 1024 GB -> "XXX GB"
+      >= 1024 GB -> "X.XX TB"
+    """
+    try:
+        f = float(gb)
+    except Exception:
+        return ""
+    if f <= 0:
+        return "0 GB"
+    if f >= 1024.0:
+        return f"{f/1024.0:.2f} TB"
+    if abs(f - round(f)) < 1e-9:
+        return f"{int(round(f))} GB"
+    return f"{f:.1f} GB"
+
+
+def human_size_from_gib(gib: float) -> str:
+    """
+    Human readable from GiB using base-1024:
+      < 1024 GiB -> "XXX GiB"
+      >= 1024 GiB -> "X.XX TiB"
+    """
+    try:
+        f = float(gib)
+    except Exception:
+        return ""
+    if f <= 0:
+        return "0 GiB"
+    if f >= 1024.0:
+        return f"{f/1024.0:.2f} TiB"
+    if abs(f - round(f)) < 1e-9:
+        return f"{int(round(f))} GiB"
+    return f"{f:.1f} GiB"
+
+
+def build_headers(devices):
+    headers = [
+        "host",
+        "vm_name",
+        "status",
+        "vcpu",
+        "cpu_util_latest",
+        "cpu_util_avg_30d",
+        "memory_gb",
+        "memory_util",
+        "memory_util_avg_30d",
+    ]
+    for dev in devices:
+        headers += [
+            f"disk_{dev}_size",
+            f"disk_{dev}_storage",
+            f"disk_{dev}_util_latest",
+            f"disk_{dev}_util_avg_30d",
+        ]
+    headers += ["total_disk_size"]
+    return headers
+
+
+# ---------- Storage unit conversions ----------
+
+def kib_to_gib(x):
+    """
+    Proxmox pvesm status usually reports total/used/avail in KiB.
+    KiB -> GiB: KiB / 1024 / 1024
+    """
+    f = safe_float(x, None)
+    if f is None:
+        return ""
+    return f / 1024.0 / 1024.0
+
+
+def bytes_to_gib(x):
+    """
+    Filesystem stats (df-like) are typically bytes.
+    bytes -> GiB: bytes / 1024^3
+    """
+    f = safe_float(x, None)
+    if f is None:
+        return ""
+    return f / 1024.0 / 1024.0 / 1024.0
+
+
+def normalize_storage_entry_proxmox(e: dict):
+    """
+    Proxmox storage entry:
+      {"name":"...", "type":"...", "status":"...", "total":..., "used":..., "avail":..., "pct":"8.27%"}
+    totals are assumed KiB.
+    """
+    if not isinstance(e, dict):
+        return None
+    name = e.get("name") or e.get("storage")
+    if not name:
+        return None
+    return {
+        "name": str(name),
+        "type": str(e.get("type", "") or ""),
+        "status": str(e.get("status", "") or ""),
+        "total_gib": kib_to_gib(e.get("total")),
+        "used_gib": kib_to_gib(e.get("used")),
+        "free_gib": kib_to_gib(e.get("avail")),
+        "pct": str(e.get("pct", "") or ""),
+    }
+
+
+def normalize_storage_entry_fs(e: dict):
+    """
+    Filesystem entry:
+      {"name":"/cephfs","total":bytes,"used":bytes,"avail":bytes,"pct":"52%","fs":"...","mount":"..."}
+    totals are assumed bytes.
+    """
+    if not isinstance(e, dict):
+        return None
+    name = e.get("name") or e.get("mount") or e.get("fs")
+    if not name:
+        return None
+    return {
+        "name": str(name),
+        "mount": str(e.get("mount", "") or ""),
+        "fs": str(e.get("fs", "") or ""),
+        "type": str(e.get("type", "") or ""),
+        "status": str(e.get("status", "") or ""),
+        "total_gib": bytes_to_gib(e.get("total")),
+        "used_gib": bytes_to_gib(e.get("used")),
+        "free_gib": bytes_to_gib(e.get("avail")),
+        "pct": str(e.get("pct", "") or ""),
+    }
+
+
+def write_location_sheet(wb: Workbook, sheet_name: str, host_blocks_for_loc):
+    # Always keep all devices for the sheet (so non-Proxmox locations keep ide/virtio/sata, etc)
+    devices = discover_all_devices(host_blocks_for_loc)
+    headers = build_headers(devices)
+
+    ws = wb.create_sheet(title=sanitize_sheet_name(sheet_name))
+    ws.append(headers)
+
+    # Header styling
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = BOLD
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    col_idx = {name: i + 1 for i, name in enumerate(headers)}
+
+    thin = Side(style="thin")
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # vm_rows: only actual VM rows (for percent formatting)
+    # bordered_rows: all rows that should get borders
+    vm_rows = set()
+    bordered_rows = {1}
+    row = 2
+
+    util_cols = [
+        col_idx["cpu_util_latest"],
+        col_idx["cpu_util_avg_30d"],
+        col_idx["memory_util"],
+        col_idx["memory_util_avg_30d"],
+    ]
+    for dev in devices:
+        util_cols.append(col_idx[f"disk_{dev}_util_latest"])
+        util_cols.append(col_idx[f"disk_{dev}_util_avg_30d"])
+
+    for host_obj in host_blocks_for_loc:
+        host = host_obj.get("host", "")
+        total_cpus = host_obj.get("total_cpus", "")
+        total_mem = host_obj.get("total_memory_gb", "")
+        vms = host_obj.get("vms", []) or []
+
+        proxmox_host = is_proxmox_host(host_obj)
+
+        # Sort VMs: running first, then name
+        def status_rank(s: str) -> int:
+            return 0 if norm_status(s) == "running" else 1
+
+        vms = sorted(vms, key=lambda vm: (status_rank(vm.get("status", "")), str(vm.get("vm_name", ""))))
+
+        # Summary totals (numeric GB)
+        run_cpu = run_ram = run_disk_gb = 0.0
+        off_cpu = off_ram = off_disk_gb = 0.0
+        all_cpu = all_ram = all_disk_gb = 0.0
+
+        # Per-storage allocation totals (based on VM disk sizes)
+        storage_alloc = {}  # storage -> {"run":..., "off":..., "total":...}
+
+        for vm in vms:
+            vm_name = vm.get("vm_name", "")
+            status = vm.get("status", "")
+            vcpu = safe_float(vm.get("vcpu"), 0.0)
+            mem_gb = safe_float(vm.get("ram_gb"), 0.0)
+
+            cpu_latest = zbx_percent_to_fraction(vm.get("cpu_utilization"))
+            cpu_avg_30d = zbx_percent_to_fraction(vm.get("cpu_utilization_avg_30d"))
+
+            mem_latest = zbx_percent_to_fraction(vm.get("ram_utilization"))
+            mem_avg_30d = zbx_percent_to_fraction(vm.get("ram_utilization_avg_30d"))
+
+            disk_sizes_gb = {dev: 0.0 for dev in devices}
+            disk_storage = {dev: "" for dev in devices}
+
+            for d in (vm.get("disks", []) or []):
+                dev = str(d.get("device") or "")
+                if dev not in disk_sizes_gb:
+                    continue
+
+                # For Proxmox hosts, only populate scsi0/1/2 (but keep other columns for other hosts)
+                if proxmox_host and dev not in PROXMOX_SCSI_ONLY_SET:
+                    continue
+
+                size_gb = safe_float(d.get("size_gb"), 0.0)
+                stg = str(d.get("storage") or "")
+
+                disk_sizes_gb[dev] += size_gb
+                if not disk_storage[dev] and stg:
+                    disk_storage[dev] = stg
+
+                if stg:
+                    storage_alloc.setdefault(stg, {"run": 0.0, "off": 0.0, "total": 0.0})
+                    storage_alloc[stg]["total"] += size_gb
+                    if is_running(status):
+                        storage_alloc[stg]["run"] += size_gb
+                    else:
+                        storage_alloc[stg]["off"] += size_gb
+
+            total_disk_vm_gb = sum(disk_sizes_gb.values())
+
+            # Write VM row
+            ws.cell(row=row, column=col_idx["host"], value=host)
+            ws.cell(row=row, column=col_idx["vm_name"], value=vm_name)
+            ws.cell(row=row, column=col_idx["status"], value=status)
+
+            ws.cell(row=row, column=col_idx["vcpu"], value=vcpu)
+            ws.cell(row=row, column=col_idx["cpu_util_latest"], value=cpu_latest)
+            ws.cell(row=row, column=col_idx["cpu_util_avg_30d"], value=cpu_avg_30d)
+
+            ws.cell(row=row, column=col_idx["memory_gb"], value=mem_gb)
+            ws.cell(row=row, column=col_idx["memory_util"], value=mem_latest)
+            ws.cell(row=row, column=col_idx["memory_util_avg_30d"], value=mem_avg_30d)
+
+            for dev in devices:
+                ws.cell(row=row, column=col_idx[f"disk_{dev}_size"], value=human_size_from_gb(disk_sizes_gb[dev]))
+                ws.cell(row=row, column=col_idx[f"disk_{dev}_storage"], value=disk_storage[dev])
+
+                disk_latest = zbx_percent_to_fraction(vm.get(f"{dev}_utilization"))
+                disk_avg = zbx_percent_to_fraction(vm.get(f"{dev}_utilization_avg_30d"))
+
+                ws.cell(row=row, column=col_idx[f"disk_{dev}_util_latest"], value=disk_latest)
+                ws.cell(row=row, column=col_idx[f"disk_{dev}_util_avg_30d"], value=disk_avg)
+
+            ws.cell(row=row, column=col_idx["total_disk_size"], value=human_size_from_gb(total_disk_vm_gb))
+
+            # Highlight running VMs
+            if is_running(status):
+                for c in range(1, len(headers) + 1):
+                    ws.cell(row=row, column=c).fill = FILL_RUNNING
+
+            # Update summary totals
+            all_cpu += vcpu
+            all_ram += mem_gb
+            all_disk_gb += total_disk_vm_gb
+            if is_running(status):
+                run_cpu += vcpu
+                run_ram += mem_gb
+                run_disk_gb += total_disk_vm_gb
+            else:
+                off_cpu += vcpu
+                off_ram += mem_gb
+                off_disk_gb += total_disk_vm_gb
+
+            vm_rows.add(row)
+            bordered_rows.add(row)
+            row += 1
+
+        # Summary rows
+        def write_summary(label, cpu_val, mem_val, disk_gb_val, fill=None):
+            nonlocal row
+            ws.cell(row=row, column=col_idx["host"], value=host).font = BOLD
+            ws.cell(row=row, column=col_idx["vm_name"], value=label).font = BOLD
+
+            ws.cell(row=row, column=col_idx["vcpu"], value=cpu_val).font = BOLD
+            ws.cell(row=row, column=col_idx["memory_gb"], value=mem_val).font = BOLD
+            ws.cell(row=row, column=col_idx["total_disk_size"], value=human_size_from_gb(disk_gb_val)).font = BOLD
+
+            # Blank utilization columns on summary rows
+            for c in util_cols:
+                ws.cell(row=row, column=c, value="")
+
+            # Blank disk columns on summary rows
+            for dev in devices:
+                ws.cell(row=row, column=col_idx[f"disk_{dev}_size"], value="")
+                ws.cell(row=row, column=col_idx[f"disk_{dev}_storage"], value="")
+
+            if fill:
+                for c in range(1, len(headers) + 1):
+                    ws.cell(row=row, column=c).fill = fill
+
+            bordered_rows.add(row)
+            row += 1
+
+        write_summary("Physical Allocation", total_cpus, total_mem, 0.0, fill=FILL_SECTION)
+        write_summary("Allocated to running VMs", run_cpu, run_ram, run_disk_gb, fill=FILL_SECTION)
+        write_summary("Allocated to shutdown VMs", off_cpu, off_ram, off_disk_gb, fill=FILL_SECTION)
+        write_summary("Allocated to both (total)", all_cpu, all_ram, all_disk_gb, fill=FILL_SECTION)
+
+        # =========================
+        # Proxmox Storage Summary (storages[])
+        # =========================
+        if host_obj.get("storages"):
+            ws.cell(row=row, column=1, value=f"{host} - Proxmox Storage Summary").font = BOLD
+            for c in range(1, len(headers) + 1):
+                ws.cell(row=row, column=c).fill = FILL_STORAGE_HDR
+            bordered_rows.add(row)
+            row += 1
+
+            hdr = [
+                "storage", "status", "type",
+                "physical_total", "physical_used", "physical_free",
+                "allocated_running", "allocated_shutdown", "allocated_total",
+                "physical_used_pct",
+            ]
+            for i, hname in enumerate(hdr, start=1):
+                ws.cell(row=row, column=i, value=hname).font = BOLD
+                ws.cell(row=row, column=i).alignment = Alignment(horizontal="center")
+                ws.cell(row=row, column=i).fill = FILL_STORAGE_HDR
+            bordered_rows.add(row)
+            row += 1
+
+            physical_map = {}
+            for e in (host_obj.get("storages", []) or []):
+                ne = normalize_storage_entry_proxmox(e)
+                if ne:
+                    physical_map[ne["name"]] = ne
+
+            all_storages = sorted(set(physical_map.keys()) | set(storage_alloc.keys()))
+
+            for stg in all_storages:
+                phys = physical_map.get(stg, {"status": "", "type": "", "total_gib": 0, "used_gib": 0, "free_gib": 0, "pct": ""})
+                alloc = storage_alloc.get(stg, {"run": 0.0, "off": 0.0, "total": 0.0})
+
+                ws.cell(row=row, column=1, value=stg)
+                ws.cell(row=row, column=2, value=phys.get("status", ""))
+                ws.cell(row=row, column=3, value=phys.get("type", ""))
+
+                ws.cell(row=row, column=4, value=human_size_from_gib(phys.get("total_gib", 0) or 0))
+                ws.cell(row=row, column=5, value=human_size_from_gib(phys.get("used_gib", 0) or 0))
+                ws.cell(row=row, column=6, value=human_size_from_gib(phys.get("free_gib", 0) or 0))
+
+                ws.cell(row=row, column=7, value=human_size_from_gb(alloc.get("run", 0.0)))
+                ws.cell(row=row, column=8, value=human_size_from_gb(alloc.get("off", 0.0)))
+                ws.cell(row=row, column=9, value=human_size_from_gb(alloc.get("total", 0.0)))
+
+                ws.cell(row=row, column=10, value=phys.get("pct", ""))  # keep as text (e.g. "8.27%")
+
+                bordered_rows.add(row)
+                row += 1
+
+        # =========================
+        # Filesystem Storage Summary (storages_fs[])
+        # =========================
+        if host_obj.get("storages_fs"):
+            ws.cell(row=row, column=1, value=f"{host} - Filesystem Storage Summary").font = BOLD
+            for c in range(1, len(headers) + 1):
+                ws.cell(row=row, column=c).fill = FILL_STORAGE_HDR
+            bordered_rows.add(row)
+            row += 1
+
+            hdr = ["name", "mount", "fs", "status", "type", "total", "used", "free", "used_pct"]
+            for i, hname in enumerate(hdr, start=1):
+                ws.cell(row=row, column=i, value=hname).font = BOLD
+                ws.cell(row=row, column=i).alignment = Alignment(horizontal="center")
+                ws.cell(row=row, column=i).fill = FILL_STORAGE_HDR
+            bordered_rows.add(row)
+            row += 1
+
+            for e in (host_obj.get("storages_fs", []) or []):
+                ne = normalize_storage_entry_fs(e)
+                if not ne:
+                    continue
+
+                ws.cell(row=row, column=1, value=ne["name"])
+                ws.cell(row=row, column=2, value=ne["mount"])
+                ws.cell(row=row, column=3, value=ne["fs"])
+                ws.cell(row=row, column=4, value=ne["status"])
+                ws.cell(row=row, column=5, value=ne["type"])
+
+                ws.cell(row=row, column=6, value=human_size_from_gib(ne["total_gib"] or 0))
+                ws.cell(row=row, column=7, value=human_size_from_gib(ne["used_gib"] or 0))
+                ws.cell(row=row, column=8, value=human_size_from_gib(ne["free_gib"] or 0))
+                ws.cell(row=row, column=9, value=ne["pct"])
+
+                bordered_rows.add(row)
+                row += 1
+
+        # Spacer row between hosts
+        row += 1
+
+    ws.freeze_panes = "A2"
+
+    # Column widths
+    for c in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 18
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 36
+    ws.column_dimensions["C"].width = 16
+
+    # ✅ Apply percent formatting ONLY to VM rows
+    for r in vm_rows:
+        for c in util_cols:
+            cell = ws.cell(row=r, column=c)
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "0.00%"
+
+    # Borders
+    max_col = max(len(headers), 10)
+    for r in sorted(bordered_rows):
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c).border = border_all
+
+
+def main():
+    data_list = load_payload(INPUT_JSON)
+    schema = detect_schema_any(data_list)
+    if schema == "unknown":
+        raise ValueError("Unknown JSON schema. Expected host blocks or a VM list / mixed list.")
+
+    if schema == "flat_mixed":
+        host_blocks = group_flat_into_host_blocks(data_list)
+    else:
+        host_blocks = []
+        for hb in data_list:
+            if isinstance(hb, dict):
+                hb = dict(hb)
+                if "location" not in hb or not hb.get("location"):
+                    hb["location"] = "unknown"
+                hb.setdefault("storages", [])
+                hb.setdefault("storages_fs", [])
+                hb.setdefault("ceph_pools", [])
+                hb.setdefault("ceph_vm_provisioned_by_pool_gb", {})
+                host_blocks.append(hb)
+
+    loc_map = split_by_location(host_blocks)
+
+    wb = Workbook()
+    default_ws = wb.active
+    wb.remove(default_ws)
+
+    for loc, blocks in loc_map.items():
+        write_location_sheet(wb, loc, blocks)
+
+    if not wb.sheetnames:
+        write_location_sheet(wb, "unknown", host_blocks)
+
+    wb.save(OUTPUT_XLSX)
+    print(f"✅ Excel created: {OUTPUT_XLSX}")
+
+
+if __name__ == "__main__":
+    main()
