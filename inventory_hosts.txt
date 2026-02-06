@@ -1,0 +1,21 @@
+# inventory hosts that have vm.inventory.get
+
+dc1_dev
+dc1-dev-converged01n.kavehkiani.com
+dc1-dev-converged02n.kavehkiani.com
+dc1-dev-converged03n.kavehkiani.com
+
+dc1_prod
+dc1-prod-converged01n.kavehkiani.com
+dc1-prod-converged02n.kavehkiani.com
+dc1-prod-converged03n.kavehkiani.com
+
+dc2_dev
+dc2-dev-converged01n.kavehkiani.com
+dc2-dev-converged02n.kavehkiani.com
+dc2-dev-converged03n.kavehkiani.com
+
+dc2_prod
+dc2-prod-converged01n.kavehkiani.com
+dc2-prod-converged02n.kavehkiani.com
+dc2-prod-converged03n.kavehkiani.com
