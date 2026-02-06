@@ -1,0 +1,2 @@
+#Go to Zabbix GUI > API Token > select your API token name or create a new one and select your api username > generate a new token and replace below token with it
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.examplepayload.4f9c8a1e2d3b
