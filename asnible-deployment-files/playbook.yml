@@ -1,0 +1,145 @@
+---
+- name: Deploy VM inventory script (proxmox/libvirt) + UserParameter + cron + restart agent2 on change
+  hosts: zbx_targets
+  become: true
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+    # default backend = libvirt
+    default_inventory_backend: libvirt
+
+    zabbix_conf_file: /etc/zabbix/zabbix_agent2.conf
+    agent2_include_dir: /etc/zabbix/zabbix_agent2.d
+    zabbix_service_name: zabbix-agent2
+
+    cron_name: "Collect VM inventory JSON for Zabbix"
+    cron_user: root
+    cron_minute: "0"
+    cron_hour: "*"
+
+    inventory_json: /etc/zabbix/vm_inventory.json
+
+  pre_tasks:
+    - name: Decide backend for this host (hostvar override, else default)
+      ansible.builtin.set_fact:
+        inventory_backend_effective: "{{ hostvars[inventory_hostname].inventory_backend | default(default_inventory_backend) }}"
+
+    - name: Validate backend value
+      ansible.builtin.assert:
+        that:
+          - inventory_backend_effective in ['proxmox', 'libvirt']
+        fail_msg: "Invalid inventory_backend='{{ inventory_backend_effective }}' for {{ inventory_hostname }}. Use proxmox or libvirt."
+
+    - name: Compute paths for selected backend and 'other' backend
+      ansible.builtin.set_fact:
+        script_src: "{{ playbook_dir }}/files/{{ inventory_backend_effective }}/zabbix_vm_inventory_collect_{{ inventory_backend_effective }}.sh"
+        script_dest: "{{ zabbix_conf_file | dirname }}/zabbix_vm_inventory_collect_{{ inventory_backend_effective }}.sh"
+
+        userparam_file: "{{ agent2_include_dir }}/vm_inventory_{{ inventory_backend_effective }}.conf"
+
+        cron_log: "/var/log/zabbix_vm_inventory_collect_{{ inventory_backend_effective }}.log"
+        oneshot_log: "/var/log/zabbix_vm_inventory_collect_{{ inventory_backend_effective }}.oneshot.log"
+
+        other_backend: "{{ 'proxmox' if inventory_backend_effective == 'libvirt' else 'libvirt' }}"
+        other_script_dest: "{{ zabbix_conf_file | dirname }}/zabbix_vm_inventory_collect_{{ 'proxmox' if inventory_backend_effective == 'libvirt' else 'libvirt' }}.sh"
+        other_userparam_file: "{{ agent2_include_dir }}/vm_inventory_{{ 'proxmox' if inventory_backend_effective == 'libvirt' else 'libvirt' }}.conf"
+
+        userparam_content: |
+          # Get VM inventory JSON
+          UserParameter=vm.inventory.get,cat {{ inventory_json }}
+
+    - name: Check for conflicting (other-backend) files already present
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ other_script_dest }}"
+        - "{{ other_userparam_file }}"
+      register: conflict_stats
+
+    - name: Fail if conflicting other-backend artifacts exist on the host (no changes will be made)
+      ansible.builtin.fail:
+        msg: |
+          Refusing to proceed on {{ inventory_hostname }}:
+          Found conflicting artifacts for backend='{{ other_backend }}' while desired backend='{{ inventory_backend_effective }}'.
+
+          Conflicts detected:
+          {% for r in conflict_stats.results %}
+          - {{ r.stat.path }} exists={{ r.stat.exists | default(false) }}
+          {% endfor %}
+
+          Fix: remove/rename the conflicting files manually, or set inventory_backend appropriately for this host.
+      when: conflict_stats.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
+
+  tasks:
+    - name: Ensure Agent2 include directory exists
+      ansible.builtin.file:
+        path: "{{ agent2_include_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy script (backend={{ inventory_backend_effective }}) next to zabbix_agent2.conf
+      ansible.builtin.copy:
+        src: "{{ script_src }}"
+        dest: "{{ script_dest }}"
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart agent2 and run script once
+
+    - name: Install UserParameter include file (no markers)
+      ansible.builtin.copy:
+        dest: "{{ userparam_file }}"
+        content: "{{ userparam_content }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart agent2 and run script once
+
+    - name: Ensure cron log file exists (optional)
+      ansible.builtin.file:
+        path: "{{ cron_log }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create/replace cron job (hourly)
+      ansible.builtin.cron:
+        name: "{{ cron_name }}"
+        user: "{{ cron_user }}"
+        minute: "{{ cron_minute }}"
+        hour: "{{ cron_hour }}"
+        job: "{{ script_dest }} >> {{ cron_log }} 2>&1"
+
+  handlers:
+    - name: Restart zabbix agent2 service
+      ansible.builtin.service:
+        name: "{{ zabbix_service_name }}"
+        state: restarted
+      listen: "Restart agent2 and run script once"
+
+    - name: Run inventory collection script once
+      ansible.builtin.command: "{{ script_dest }}"
+      register: oneshot_run
+      changed_when: true
+      listen: "Restart agent2 and run script once"
+
+    - name: Write one-shot output to log
+      ansible.builtin.copy:
+        dest: "{{ oneshot_log }}"
+        content: |
+          backend={{ inventory_backend_effective }}
+          rc={{ oneshot_run.rc }}
+          stdout:
+          {{ oneshot_run.stdout | default('') }}
+          stderr:
+          {{ oneshot_run.stderr | default('') }}
+        owner: root
+        group: root
+        mode: "0644"
+      listen: "Restart agent2 and run script once"
+
